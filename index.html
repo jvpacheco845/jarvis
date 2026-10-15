@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>J.A.R.V.I.S.</title>
+<style>
+  :root { --c:#00d4ff; --bg:#020b14; --dim:#0a3a4d; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:radial-gradient(circle at 50% 40%, #07263a 0%, var(--bg) 70%); color:var(--c); font-family:"Segoe UI",Arial,sans-serif; overflow:hidden; }
+  #wrap { display:flex; flex-direction:column; align-items:center; height:100%; padding:16px; }
+  h1 { letter-spacing:.5em; font-weight:300; margin:6px 0 0; font-size:20px; text-shadow:0 0 12px var(--c); }
+  #status { font-size:13px; letter-spacing:.2em; opacity:.8; height:18px; margin-top:4px; text-transform:uppercase; }
+  canvas { width:min(60vh,90vw); height:min(60vh,90vw); flex:none; }
+  #log { width:min(760px,95vw); flex:1; overflow-y:auto; border:1px solid var(--dim); border-radius:8px; padding:10px 14px; background:rgba(0,20,35,.6); font-size:15px; line-height:1.5; }
+  .u { color:#9fe8ff; opacity:.85; } .j { color:var(--c); text-shadow:0 0 6px rgba(0,212,255,.5); } .s { color:#6aa; font-size:12px; }
+  #bar { display:flex; gap:8px; width:min(760px,95vw); margin-top:10px; }
+  input[type=text] { flex:1; background:#03141f; border:1px solid var(--dim); color:var(--c); padding:10px; border-radius:6px; outline:none; }
+  button { background:transparent; color:var(--c); border:1px solid var(--c); padding:10px 16px; border-radius:6px; cursor:pointer; letter-spacing:.1em; }
+  button:hover { background:rgba(0,212,255,.15); box-shadow:0 0 10px var(--c); }
+  label { font-size:12px; opacity:.8; display:flex; align-items:center; gap:4px; margin-top:8px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <h1>J.A.R.V.I.S.</h1>
+  <div id="status">OFFLINE</div>
+  <canvas id="hud" width="600" height="600"></canvas>
+  <div id="log"></div>
+  <div id="bar">
+    <button id="btnMic">ATIVAR VOZ</button>
+    <input id="txt" type="text" placeholder="Ou digite aqui e aperte Enter...">
+  </div>
+  <label><input type="checkbox" id="wake" checked> Exigir palavra de ativação ("Jarvis, ...")</label>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const log = $("#log"), statusEl = $("#status");
+let state = "idle", busy = false, running = false, awakeUntil = 0, history = [];
+let token = localStorage.getItem("jarvis_token") || "";
+
+function addLog(cls, text) {
+  const d = document.createElement("div"); d.className = cls; d.textContent = text;
+  log.appendChild(d); log.scrollTop = log.scrollHeight;
+}
+function setState(s) {
+  state = s;
+  statusEl.textContent = { idle:"EM ESPERA", listening:"ESCUTANDO", thinking:"PROCESSANDO", speaking:"FALANDO" }[s] || s;
+}
+
+/* ---------- Voz: fala ---------- */
+let ptVoice = null;
+function pickVoice() {
+  const v = speechSynthesis.getVoices();
+  ptVoice = v.find(x => x.lang === "pt-BR" && /google|luciana|francisca|microsoft/i.test(x.name)) || v.find(x => x.lang.startsWith("pt")) || null;
+}
+speechSynthesis.onvoiceschanged = pickVoice; pickVoice();
+
+function speak(text) {
+  return new Promise(res => {
+    const clean = text.replace(/[*_#`]/g, "");
+    const u = new SpeechSynthesisUtterance(clean);
+    u.lang = "pt-BR"; if (ptVoice) u.voice = ptVoice; u.rate = 1.05; u.pitch = 0.9;
+    setState("speaking");
+    u.onend = u.onerror = () => { setTimeout(() => { setState(running ? "listening" : "idle"); res(); }, 600); };
+    speechSynthesis.cancel(); speechSynthesis.speak(u);
+  });
+}
+
+/* ---------- Voz: escuta ---------- */
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let rec = null;
+function startRec() {
+  if (!SR) { addLog("s", "Seu navegador não suporta reconhecimento de voz. Use Chrome ou Edge."); return; }
+  rec = new SR(); rec.lang = "pt-BR"; rec.continuous = true; rec.interimResults = false;
+  rec.onresult = e => {
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      if (e.results[i].isFinal) handleHeard(e.results[i][0].transcript.trim());
+    }
+  };
+  rec.onend = () => { if (running) { try { rec.start(); } catch (_) {} } };
+  rec.onerror = ev => { if (ev.error === "not-allowed") { running = false; addLog("s", "Permita o microfone no navegador."); } };
+  rec.start(); running = true; setState("listening");
+  $("#btnMic").textContent = "DESLIGAR VOZ";
+}
+function stopRec() { running = false; if (rec) rec.stop(); setState("idle"); $("#btnMic").textContent = "ATIVAR VOZ"; }
+$("#btnMic").onclick = () => running ? stopRec() : startRec();
+
+function handleHeard(text) {
+  if (busy || !text) return;
+  const lower = text.toLowerCase();
+  if ($("#wake").checked) {
+    const m = lower.match(/j[aá]rvis|j[aá]rves|jarvi[sz]/);
+    if (m) {
+      const cmd = text.slice(m.index + m[0].length).replace(/^[\s,.:;!?-]+/, "");
+      awakeUntil = Date.now() + 10000;
+      if (!cmd) { return say("Pois não, senhor?"); }
+      return process(cmd);
+    }
+    if (Date.now() < awakeUntil) return process(text);
+    return; // ignora conversas sem a palavra de ativação
+  }
+  process(text);
+}
+
+/* ---------- Comandos locais ---------- */
+function localCommand(t) {
+  t = t.toLowerCase();
+  if (/que horas|hora atual/.test(t)) return `Agora são ${new Date().toLocaleTimeString("pt-BR",{hour:"2-digit",minute:"2-digit"})}.`;
+  if (/que dia|data de hoje|qual a data/.test(t)) return `Hoje é ${new Date().toLocaleDateString("pt-BR",{weekday:"long",day:"numeric",month:"long",year:"numeric"})}.`;
+  let m;
+  if (/abr(e|ir) (o )?youtube/.test(t)) { window.open("https://youtube.com","_blank"); return "Abrindo o YouTube."; }
+  if (/abr(e|ir) (o )?google/.test(t)) { window.open("https://google.com","_blank"); return "Abrindo o Google."; }
+  if ((m = t.match(/(?:pesquis(?:e|ar)|procur(?:e|ar))(?: por| sobre)? (.+)/))) {
+    window.open("https://www.google.com/search?q=" + encodeURIComponent(m[1]), "_blank"); return `Pesquisando ${m[1]}.`;
+  }
+  if (/limpar (a )?conversa|esquece tudo/.test(t)) { history = []; return "Memória da conversa limpa."; }
+  return null;
+}
+
+/* ---------- Cérebro (nuvem) ---------- */
+async function say(text) { busy = true; addLog("j", "JARVIS: " + text); await speak(text); busy = false; }
+
+async function process(text) {
+  busy = true; addLog("u", "Você: " + text);
+  const local = localCommand(text);
+  if (local) { addLog("j", "JARVIS: " + local); await speak(local); busy = false; return; }
+  setState("thinking");
+  history.push({ role: "user", text });
+  try {
+    if (!token) { token = prompt("Senha do JARVIS (JARVIS_TOKEN):") || ""; localStorage.setItem("jarvis_token", token); }
+    const r = await fetch("/api/chat", { method:"POST", headers:{ "Content-Type":"application/json", "x-token": token }, body: JSON.stringify({ messages: history }) });
+    if (r.status === 401) { localStorage.removeItem("jarvis_token"); token = ""; throw new Error("Senha incorreta"); }
+    if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.detail || "Erro " + r.status); }
+    const { reply } = await r.json();
+    history.push({ role: "assistant", text: reply });
+    addLog("j", "JARVIS: " + reply); await speak(reply);
+  } catch (err) {
+    history.pop();
+    addLog("s", "Falha: " + err.message); await speak("Tive um problema de conexão, senhor.");
+  }
+  busy = false;
+}
+
+$("#txt").addEventListener("keydown", e => {
+  if (e.key === "Enter" && e.target.value.trim()) { const t = e.target.value.trim(); e.target.value = ""; if (!busy) process(t); }
+});
+
+/* ---------- HUD animado ---------- */
+const cv = $("#hud"), ctx = cv.getContext("2d");
+let t0 = 0;
+function draw(ts) {
+  const t = ts / 1000, W = cv.width, cx = W / 2, cy = W / 2;
+  ctx.clearRect(0, 0, W, W);
+  const energy = { idle:0.15, listening:0.5, thinking:0.9, speaking:1 }[state];
+  const pulse = 1 + Math.sin(t * (2 + energy * 6)) * 0.03 * energy;
+  ctx.lineCap = "round";
+  const rings = [ [230,3,0.6,0.35], [195,2,-1.1,0.5], [160,5,1.7,0.7], [120,2,-2.4,0.9] ];
+  rings.forEach(([r, w, sp, op], i) => {
+    ctx.strokeStyle = `rgba(0,212,255,${op})`; ctx.lineWidth = w;
+    ctx.shadowColor = "#00d4ff"; ctx.shadowBlur = 12;
+    for (let k = 0; k < 3 + i; k++) {
+      const a0 = t * sp * (0.5 + energy) + k * (Math.PI * 2 / (3 + i));
+      ctx.beginPath(); ctx.arc(cx, cy, r * pulse, a0, a0 + 0.9); ctx.stroke();
+    }
+  });
+  ctx.shadowBlur = 25;
+  const g = ctx.createRadialGradient(cx, cy, 5, cx, cy, 90 * pulse);
+  g.addColorStop(0, `rgba(180,245,255,${0.5 + energy * 0.5})`); g.addColorStop(1, "rgba(0,212,255,0)");
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(cx, cy, 90 * pulse, 0, Math.PI * 2); ctx.fill();
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+setState("idle");
+addLog("s", "Sistema online. Clique em ATIVAR VOZ e diga: \"Jarvis, que horas são?\"");
+</script>
+</body>
+</html>
